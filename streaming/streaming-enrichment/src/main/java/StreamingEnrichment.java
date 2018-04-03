@@ -38,10 +38,12 @@ import java.util.Random;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.locks.LockSupport;
 
-import static com.hazelcast.jet.pipeline.JournalInitialPosition.START_FROM_CURRENT;
+import static com.hazelcast.jet.datamodel.Tuple3.tuple3;
 import static com.hazelcast.jet.function.DistributedFunctions.entryValue;
 import static com.hazelcast.jet.pipeline.JoinClause.joinMapEntries;
+import static com.hazelcast.jet.pipeline.JournalInitialPosition.START_FROM_CURRENT;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static processor.ImapTransformP.mapUsingImap;
 
 /**
  * Demonstrates the usage of the Pipeline API's hash-join transform to
@@ -127,6 +129,28 @@ public final class StreamingEnrichment {
         return p;
     }
 
+    // Demonstrates the use of the more general, but less type-safe API
+    // that can construct a hash join with arbitrarily many enriching streams
+    private static Pipeline imapEnrichment() {
+        Pipeline p = Pipeline.create();
+
+        // The stream to be enriched: trades
+        StreamStage<Tuple3<Trade, Product, Broker>> joined =
+                p.drawFrom(Sources.<Object, Trade>mapJournal(TRADES, START_FROM_CURRENT))
+                 .map(entryValue())
+                 .<Tuple2<Trade, Product>>customTransform("enrich-product",
+                         mapUsingImap(PRODUCTS, Trade::productId, (f0, f1) -> Tuple2.tuple2(f0, f1)))
+                 .customTransform("enrich-broker",
+                         mapUsingImap(BROKERS, (Tuple2<Trade, Product> tuple2) -> tuple2.f0().brokerId(),
+                                 (tuple2, broker) -> tuple3(tuple2.f0(), tuple2.f1(), broker)));
+
+        // Validates the joined tuples and sends them to the logging sink
+        joined.map(StreamingEnrichment::validateDirectJoinedItem)
+              .drainTo(Sinks.logger());
+
+        return p;
+    }
+
     public static void main(String[] args) throws Exception {
         System.setProperty("hazelcast.logging.type", "log4j");
         // Lower operation timeout to speed up job cancellation
@@ -153,6 +177,11 @@ public final class StreamingEnrichment {
             Job job2 = jet.newJob(joinBuild());
             eventGenerator.generateEventsForFiveSeconds();
             job2.cancel();
+            Thread.sleep(2000);
+
+            Job job3 = jet.newJob(imapEnrichment());
+            eventGenerator.generateEventsForFiveSeconds();
+            job3.cancel();
             Thread.sleep(2000);
         } finally {
             eventGenerator.shutdown();
